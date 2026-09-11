@@ -1,0 +1,9 @@
+# Hemmeligheter og lokal tilstand — skal aldri i repoet
+.env
+.env.*
+!.env.example
+token.json
+*.har
+__pycache__/
+*.pyc
+.venv/
