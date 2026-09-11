@@ -1,4 +1,4 @@
-# Hemmeligheter og lokal tilstand — skal aldri i repoet
+# Secrets and local state — must never be committed
 .env
 .env.*
 !.env.example

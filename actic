@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Se og book gruppetimer hos Actic (minesider.actic.no).
+"""View and book group fitness classes at Actic (minesider.actic.no).
 
-APIet er det samme som weben bruker: https://webapi.actic.se/ med et opakt
-bearer-token fra login. Token caches i ~/state/actic-token.json og fornyes
-automatisk når check-auth-token feiler.
+Uses the same API as the web app: https://webapi.actic.se/ with an opaque
+bearer token from login. The token is cached in ~/.config/actic/token.json
+and refreshed automatically when check-auth-token fails.
 
-Venteliste har ikke eget endepunkt — samme POST gir ventelisteplass når
-klassen er full. Derfor krever `book` eksplisitt --waitlist i de tilfellene.
+There is no separate waiting list endpoint — the same POST puts you on the
+waiting list when a class is full, so `book` requires an explicit --waitlist
+in that case.
 
-Brukernavn/passord leses fra ACTIC_USERNAME / ACTIC_PASSWORD, enten som
-miljovariabler eller fra en env-fil (se CONFIG_FILES). Ingen hemmeligheter
-lagres i dette repoet.
+Credentials are read from ACTIC_USERNAME / ACTIC_PASSWORD, either as
+environment variables or from an env file (see CONFIG_FILES). No secrets are
+stored in this repository.
 """
 
 import argparse
@@ -25,21 +26,21 @@ import requests
 
 API = os.environ.get("ACTIC_API", "https://webapi.actic.se/")
 
-# Token-cache. Overstyres med ACTIC_TOKEN_FILE.
+# Token cache. Override with ACTIC_TOKEN_FILE.
 STATE = Path(os.environ.get(
     "ACTIC_TOKEN_FILE", Path.home() / ".config" / "actic" / "token.json"))
 
-# Env-filer som leses hvis variablene ikke allerede star i miljoet.
-# ACTIC_ENV_FILE gar foran alt.
+# Env files read when the variables are not already in the environment.
+# ACTIC_ENV_FILE takes precedence over everything else.
 CONFIG_FILES = [Path(p).expanduser() for p in filter(None, [
     os.environ.get("ACTIC_ENV_FILE"),
     Path.home() / ".config" / "actic" / "env",
     Path.cwd() / ".env",
-    Path.home() / ".env.vps",
 ])]
 
-# Senter-ID. Kjor `actic centers` for a finne din egen.
-DEFAULT_CENTER = int(os.environ.get("ACTIC_CENTER", 544))
+# Center ID. Defaults to the home center on your membership; override with
+# ACTIC_CENTER or --center. Run `actic centers` to list IDs.
+DEFAULT_CENTER = int(os.environ["ACTIC_CENTER"]) if os.environ.get("ACTIC_CENTER") else None
 DEFAULT_COUNTRY = os.environ.get("ACTIC_COUNTRY", "NO")
 
 HEADERS = {
@@ -74,6 +75,7 @@ class Actic:
         self.session.headers.update(HEADERS)
         self.token = None
         self.person_id = None
+        self.home_center = None
         self._load_cache()
 
     # --- auth ---------------------------------------------------------
@@ -82,14 +84,17 @@ class Actic:
             data = json.loads(STATE.read_text())
             self.token = data.get("token")
             self.person_id = data.get("externalId")
+            self.home_center = data.get("homeCenter")
 
     def _save_cache(self):
         STATE.parent.mkdir(parents=True, exist_ok=True)
-        STATE.write_text(json.dumps({"token": self.token, "externalId": self.person_id}))
+        STATE.write_text(json.dumps({"token": self.token, "externalId": self.person_id,
+                                     "homeCenter": self.home_center}))
         STATE.chmod(0o600)
 
     def _auth_header(self):
-        # Weben sender tokenet i begge headerne; data-endepunktene krever Access-Token.
+        # The web app sends the token in both headers; the data endpoints
+        # reject requests that only carry Authorization.
         return {"Authorization": "Bearer " + self.token, "Access-Token": self.token}
 
     def ensure_auth(self):
@@ -105,20 +110,20 @@ class Actic:
         pw = load_env("ACTIC_PASSWORD")
         if not user or not pw:
             raise ActicError(
-                "Mangler ACTIC_USERNAME / ACTIC_PASSWORD. Sett dem som "
-                "miljovariabler, eller legg dem i %s (se .env.example)."
-                % CONFIG_FILES[-1])
+                "Missing ACTIC_USERNAME / ACTIC_PASSWORD. Set them as environment "
+                "variables, or put them in %s (see .env.example)." % CONFIG_FILES[-1])
         r = self.session.post(API + "login", json={"username": user, "password": pw}, timeout=30)
         if not r.ok:
-            raise ActicError("Login feilet (HTTP %d)" % r.status_code)
+            raise ActicError("Login failed (HTTP %d)" % r.status_code)
         data = r.json()
         if not data.get("success") or not data.get("accessToken"):
-            raise ActicError("Login avvist — sjekk brukernavn og passord")
+            raise ActicError("Login rejected — check your username and password")
         self.token = data["accessToken"]
         self.person_id = data["person"]["personId"]["externalId"]
+        self.home_center = data["person"]["personId"].get("center")
         self._save_cache()
 
-    # --- kall ---------------------------------------------------------
+    # --- requests -----------------------------------------------------
     def call(self, method, path, **kw):
         self.ensure_auth()
         r = self.session.request(method, API + path, headers=self._auth_header(), timeout=30, **kw)
@@ -130,19 +135,32 @@ class Actic:
                 err = r.json().get("error") or r.text[:200]
             except ValueError:
                 err = r.text[:200]
-            raise ActicError("%s %s feilet (HTTP %d): %s" % (method, path, r.status_code, err))
+            raise ActicError("%s %s failed (HTTP %d): %s" % (method, path, r.status_code, err))
         return r.json()
 
     def person(self):
-        """externalId — krever at vi er innlogget, siden den inngår i URL-ene."""
+        """externalId — requires a valid session, since it is part of every URL."""
         self.ensure_auth()
         return self.person_id
 
-    def centers(self, country="NO"):
+    def default_centers(self):
+        """Centers to use when the caller did not pick any."""
+        if DEFAULT_CENTER:
+            return [DEFAULT_CENTER]
+        self.ensure_auth()
+        if not self.home_center:
+            # Cache written before home center was tracked — refresh it.
+            self.login()
+        if not self.home_center:
+            raise ActicError("Could not determine your home center — pass --center "
+                             "or set ACTIC_CENTER (see `actic centers`).")
+        return [self.home_center]
+
+    def centers(self, country=DEFAULT_COUNTRY):
         return self.call("GET", "db/centers/%s" % country)
 
-    def classes(self, centers):
-        ids = ",".join(str(c) for c in centers)
+    def classes(self, centers=None):
+        ids = ",".join(str(c) for c in (centers or self.default_centers()))
         return self.call("GET", "persons/%s/centers/%s/classesAll" % (self.person(), ids))
 
     def participations(self):
@@ -156,7 +174,7 @@ class Actic:
                          % (self.person(), booking_compound, participation_compound))
 
 
-# --- hjelpere ---------------------------------------------------------
+# --- helpers ----------------------------------------------------------
 def compound(key):
     return "%sp%s" % (key["center"], key["id"])
 
@@ -170,7 +188,7 @@ def flatten(classes_payload):
 
 
 def summarize(c):
-    """Felles, maskinlesbar form av en klasse."""
+    """Shared, machine-readable shape of a class."""
     remaining = c.get("classCapacityRemaning", 0)
     booked = bool(c.get("participation"))
     state = c.get("bookingState", "")
@@ -201,25 +219,28 @@ def summarize(c):
     }
 
 
-DAYS_NO = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"]
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def weekday(date_str):
+    return DAYS[datetime.strptime(date_str, "%Y-%m-%d").weekday()]
 
 
 def fmt(s):
-    day = DAYS_NO[datetime.strptime(s["date"], "%Y-%m-%d").weekday()]
-    line = "%s %s %s-%s  %s" % (day, s["date"], s["start"], s["end"], s["name"])
+    line = "%s %s %s-%s  %s" % (weekday(s["date"]), s["date"], s["start"], s["end"], s["name"])
     if s["status"] == "BOOKED":
-        tail = "PÅMELDT"
+        tail = "BOOKED"
     elif s["status"] == "WAITINGLIST":
-        tail = "fullt (%d på venteliste)" % s["waiting_list"]
+        tail = "full (%d on waiting list)" % s["waiting_list"]
     elif s["status"] == "NOT_BOOKABLE":
-        tail = "ikke bookbar"
+        tail = "not bookable"
     else:
-        tail = "%d ledige" % s["remaining"]
-    return "%s  [%s]  %s  — %s" % (line, s["id"], tail, s["instructor"] or "")
+        tail = "%d spots left" % s["remaining"]
+    return "%s  [%s]  %s  - %s" % (line, s["id"], tail, s["instructor"] or "")
 
 
 def find_class(items, needle):
-    """Slår opp på bookingIdCompound, eller på fritekst «WOD 2026-09-14 06:30»."""
+    """Matches on bookingIdCompound, or on free text like "WOD 2026-09-14 06:30"."""
     for s in items:
         if s["id"] == needle:
             return s
@@ -230,12 +251,12 @@ def find_class(items, needle):
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        raise ActicError("Flere treff på «%s»:\n%s"
+        raise ActicError('Several classes match "%s":\n%s'
                          % (needle, "\n".join(fmt(m) for m in matches)))
     return None
 
 
-# --- kommandoer -------------------------------------------------------
+# --- commands ---------------------------------------------------------
 def cmd_classes(api, args):
     payload = api.classes(args.center)
     items = [summarize(c) for c in flatten(payload)]
@@ -256,13 +277,13 @@ def cmd_classes(api, args):
             "classes": items,
         }, ensure_ascii=False, indent=2))
         return
-    print("Booket %s av %s mulige\n" % (payload.get("participations_count"),
+    print("%s of %s bookings used\n" % (payload.get("participations_count"),
                                         payload.get("participations_max")))
     for s in items:
         print(fmt(s))
 
 
-def cmd_mine(api, args):
+def cmd_bookings(api, args):
     parts = api.participations()
     if isinstance(parts, dict):
         parts = list(parts.values())
@@ -285,34 +306,33 @@ def cmd_mine(api, args):
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
     if not rows:
-        print("Ingen bookinger.")
+        print("No bookings.")
         return
     for r in rows:
-        day = DAYS_NO[datetime.strptime(r["date"], "%Y-%m-%d").weekday()]
-        print("%s %s %s-%s  %s  [%s]  %s — %s"
-              % (day, r["date"], r["start"], r["end"], r["name"], r["id"],
+        print("%s %s %s-%s  %s  [%s]  %s - %s"
+              % (weekday(r["date"]), r["date"], r["start"], r["end"], r["name"], r["id"],
                  r["state"], r["instructor"] or ""))
 
 
 def cmd_book(api, args):
     payload = api.classes(args.center)
     items = [summarize(c) for c in flatten(payload)]
-    target = find_class(items, args.klasse)
+    target = find_class(items, args.klass)
     if not target:
-        raise ActicError("Fant ingen time som matcher «%s»" % args.klasse)
+        raise ActicError('No class matches "%s"' % args.klass)
     if target["status"] == "BOOKED":
-        raise ActicError("Allerede påmeldt %s" % fmt(target))
+        raise ActicError("Already booked: %s" % fmt(target))
     if target["status"] == "NOT_BOOKABLE":
-        raise ActicError("Kan ikke bookes: %s (%s)" % (fmt(target), target["state_info"]))
+        raise ActicError("Not bookable: %s (%s)" % (fmt(target), target["state_info"]))
     if target["status"] == "WAITINGLIST" and not args.waitlist:
         print("FULL: %s" % fmt(target), file=sys.stderr)
-        print("Timen er full. Kjør på nytt med --waitlist for ventelisteplass "
-              "(%d av %s plasser på venteliste brukt)."
+        print("This class is full. Run again with --waitlist to take a waiting list "
+              "spot (%d of %s waiting list spots used)."
               % (target["waiting_list"], target["waiting_list_capacity"]), file=sys.stderr)
         sys.exit(2)
     res = api.book(target["id"])
     if not res.get("success"):
-        raise ActicError("Booking feilet: %s" % json.dumps(res, ensure_ascii=False)[:300])
+        raise ActicError("Booking failed: %s" % json.dumps(res, ensure_ascii=False)[:300])
     p = res.get("participation", {})
     if args.json:
         print(json.dumps({
@@ -323,8 +343,8 @@ def cmd_book(api, args):
             "participations_max": res.get("participations_max"),
         }, ensure_ascii=False, indent=2))
         return
-    word = "Satt på venteliste for" if p.get("state") == "WAITING_LIST" else "Påmeldt"
-    print("%s %s (%s/%s bookinger brukt)"
+    word = "Added to waiting list for" if p.get("state") == "WAITING_LIST" else "Booked"
+    print("%s %s (%s/%s bookings used)"
           % (word, fmt(target), res.get("participations_count"), res.get("participations_max")))
 
 
@@ -337,22 +357,22 @@ def cmd_cancel(api, args):
         b = p.get("booking", {})
         bid = compound(b["bookingId"])
         haystack = " ".join(filter(None, [bid, b.get("name"), b.get("date"), b.get("startTime")])).lower()
-        if bid == args.klasse or all(t in haystack for t in args.klasse.lower().split()):
+        if bid == args.klass or all(t in haystack for t in args.klass.lower().split()):
             if hit:
-                raise ActicError("Flere bookinger matcher «%s» — bruk booking-ID." % args.klasse)
+                raise ActicError('Several bookings match "%s" — use the booking ID.' % args.klass)
             hit = (bid, compound(p["participationId"]), b)
     if not hit:
-        raise ActicError("Fant ingen booking som matcher «%s»" % args.klasse)
+        raise ActicError('No booking matches "%s"' % args.klass)
     bid, pid, b = hit
     res = api.cancel(bid, pid)
     if not res.get("success"):
-        raise ActicError("Avbooking feilet: %s" % json.dumps(res, ensure_ascii=False)[:300])
+        raise ActicError("Cancellation failed: %s" % json.dumps(res, ensure_ascii=False)[:300])
     if args.json:
         print(json.dumps({"cancelled": bid, "date": b.get("date"), "name": b.get("name"),
                           "participations_count": res.get("participations_count")},
                          ensure_ascii=False, indent=2))
         return
-    print("Avbooket %s %s %s (%s/%s bookinger brukt)"
+    print("Cancelled %s %s %s (%s/%s bookings used)"
           % (b.get("name"), b.get("date"), b.get("startTime"),
              res.get("participations_count"), res.get("participations_max")))
 
@@ -367,47 +387,54 @@ def cmd_centers(api, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Actic gruppetimer: se, book og avbook.")
-    ap.add_argument("--json", action="store_true", help="maskinlesbar output")
+    ap = argparse.ArgumentParser(
+        description="Actic group classes: view the schedule, book and cancel.")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+
+    # Shared so that --json works both before and after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def center_arg(p):
+        default_help = str(DEFAULT_CENTER) if DEFAULT_CENTER else "your home center"
         p.add_argument("--center", type=int, action="append", default=None,
-                       help="senter-ID (kan gjentas). Standard: %d (Asker)" % DEFAULT_CENTER)
+                       help="center ID (repeatable). Default: %s" % default_help)
 
-    p = sub.add_parser("classes", help="vis timeplan")
+    p = sub.add_parser("classes", parents=[common], help="show the class schedule")
     center_arg(p)
-    p.add_argument("--days", type=int, help="antall dager fremover")
-    p.add_argument("--date", help="kun denne datoen (YYYY-MM-DD)")
-    p.add_argument("--name", help="filtrer på klassenavn, f.eks. WOD")
-    p.add_argument("--bookable", action="store_true", help="skjul timer som ikke kan bookes")
+    p.add_argument("--days", type=int, help="number of days ahead")
+    p.add_argument("--date", help="only this date (YYYY-MM-DD)")
+    p.add_argument("--name", help="filter by class name, e.g. WOD")
+    p.add_argument("--bookable", action="store_true", help="hide classes that cannot be booked")
     p.set_defaults(func=cmd_classes)
 
-    p = sub.add_parser("mine", help="vis egne bookinger")
-    p.set_defaults(func=cmd_mine)
+    p = sub.add_parser("bookings", aliases=["mine"], parents=[common], help="show your own bookings")
+    p.set_defaults(func=cmd_bookings)
 
-    p = sub.add_parser("book", help="book en time")
-    p.add_argument("klasse", help="booking-ID (544p144115) eller «WOD 2026-09-14 06:30»")
+    p = sub.add_parser("book", parents=[common], help="book a class")
+    p.add_argument("klass", metavar="CLASS",
+                   help='booking ID (544p144115) or free text ("WOD 2026-09-14 06:30")')
     p.add_argument("--waitlist", action="store_true",
-                   help="godta ventelisteplass hvis timen er full")
+                   help="accept a waiting list spot if the class is full")
     center_arg(p)
     p.set_defaults(func=cmd_book)
 
-    p = sub.add_parser("cancel", help="avbook en time")
-    p.add_argument("klasse", help="booking-ID eller søketekst")
+    p = sub.add_parser("cancel", parents=[common], help="cancel a booking")
+    p.add_argument("klass", metavar="CLASS", help="booking ID or free text")
     p.set_defaults(func=cmd_cancel)
 
-    p = sub.add_parser("centers", help="list sentre")
+    p = sub.add_parser("centers", parents=[common], help="list centers")
     p.add_argument("--country", default=DEFAULT_COUNTRY)
     p.set_defaults(func=cmd_centers)
 
     args = ap.parse_args()
-    if getattr(args, "center", None) is None:
-        args.center = [DEFAULT_CENTER]
     try:
         args.func(Actic(), args)
     except ActicError as e:
-        print("Feil: %s" % e, file=sys.stderr)
+        print("Error: %s" % e, file=sys.stderr)
         sys.exit(1)
 
 
